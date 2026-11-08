@@ -64,6 +64,7 @@ struct AxisParam {
   uint32_t acceleration = 2000;
   int32_t  travel = 1000;
   uint32_t pauseMs = 500;
+  uint32_t maxTravelMm = 0;  // 最大行程 (mm)，0 = 不限制
 };
 AxisParam xParam, yParam, zParam;
 
@@ -101,6 +102,24 @@ struct ClickState {
 };
 ClickState click;
 bool       clickRunning = false;
+
+// ================= 步/mm 换算 =================
+// 10000 步 = 10 cm，即 100 步/mm；不同丝杆/细分请修改此值
+#define STEPS_PER_MM 100
+
+// 目标超出最大行程（mm，0=不限制）时返回 true
+bool targetExceedsLimit(int32_t target, uint32_t maxTravelMm) {
+  if (maxTravelMm == 0) return false;
+  int32_t maxSteps = (int32_t)maxTravelMm * STEPS_PER_MM;
+  return target < 0 || target > maxSteps;
+}
+
+// 默认最大行程 (mm)，可在网页"运动参数"表中修改并保存
+void initParamDefaults() {
+  xParam.maxTravelMm = 210;
+  yParam.maxTravelMm = 300;
+  zParam.maxTravelMm = 10;
+}
 
 // ================= EN 控制 =================
 void setMotorEnable(bool en) {
@@ -176,16 +195,19 @@ void loadParams() {
   xParam.acceleration = prefs.getUInt("xAccel",  xParam.acceleration);
   xParam.travel       = prefs.getInt ("xTravel", xParam.travel);
   xParam.pauseMs      = prefs.getUInt("xPause",  xParam.pauseMs);
+  xParam.maxTravelMm  = prefs.getUInt("xMaxMm",  xParam.maxTravelMm);
 
   yParam.speed        = prefs.getUInt("ySpeed",  yParam.speed);
   yParam.acceleration = prefs.getUInt("yAccel",  yParam.acceleration);
   yParam.travel       = prefs.getInt ("yTravel", yParam.travel);
   yParam.pauseMs      = prefs.getUInt("yPause",  yParam.pauseMs);
+  yParam.maxTravelMm  = prefs.getUInt("yMaxMm",  yParam.maxTravelMm);
 
   zParam.speed        = prefs.getUInt("zSpeed",  zParam.speed);
   zParam.acceleration = prefs.getUInt("zAccel",  zParam.acceleration);
   zParam.travel       = prefs.getInt ("zTravel", zParam.travel);
   zParam.pauseMs      = prefs.getUInt("zPause",  zParam.pauseMs);
+  zParam.maxTravelMm  = prefs.getUInt("zMaxMm",  zParam.maxTravelMm);
 
   axisMask            = prefs.getUInt("axisMask", axisMask);
   runMode             = prefs.getUInt("runMode",  runMode);
@@ -198,16 +220,19 @@ void saveParamsToNVS() {
   prefs.putUInt("xAccel",  xParam.acceleration);
   prefs.putInt ("xTravel", xParam.travel);
   prefs.putUInt("xPause",  xParam.pauseMs);
+  prefs.putUInt("xMaxMm",  xParam.maxTravelMm);
 
   prefs.putUInt("ySpeed",  yParam.speed);
   prefs.putUInt("yAccel",  yParam.acceleration);
   prefs.putInt ("yTravel", yParam.travel);
   prefs.putUInt("yPause",  yParam.pauseMs);
+  prefs.putUInt("yMaxMm",  yParam.maxTravelMm);
 
   prefs.putUInt("zSpeed",  zParam.speed);
   prefs.putUInt("zAccel",  zParam.acceleration);
   prefs.putInt ("zTravel", zParam.travel);
   prefs.putUInt("zPause",  zParam.pauseMs);
+  prefs.putUInt("zMaxMm",  zParam.maxTravelMm);
 
   prefs.putUInt("axisMask", axisMask);
   prefs.putUInt("runMode",  runMode);
@@ -439,6 +464,12 @@ h1 span{color:var(--primary)}
   html += "<td><input type='number' id='yPause' value='" + String(yParam.pauseMs) + "'></td>";
   html += "<td><input type='number' id='zPause' value='" + String(zParam.pauseMs) + "'></td>";
   html += "</tr>";
+  html += "<tr>";
+  html += "<td class='param-label'>最大行程 (mm)</td>";
+  html += "<td><input type='number' id='xMaxMm' value='" + String(xParam.maxTravelMm) + "' title='0 = 不限制'></td>";
+  html += "<td><input type='number' id='yMaxMm' value='" + String(yParam.maxTravelMm) + "' title='0 = 不限制'></td>";
+  html += "<td><input type='number' id='zMaxMm' value='" + String(zParam.maxTravelMm) + "' title='0 = 不限制'></td>";
+  html += "</tr>";
   html += "</tbody>";
 
   // 末行：往返、单次、停止、清零、保存
@@ -455,7 +486,8 @@ h1 span{color:var(--primary)}
   html += "</table>";
   html += "</div>";
   html += "<div class='note'>表头点击可启用/停用对应轴；参数会写入 NVS，断电后自动恢复。"
-          "各轴按自己的停顿值独立往返，不再共用最大值。</div>";
+          "各轴按自己的停顿值独立往返，不再共用最大值。"
+          "最大行程是 API 与手动运行的安全上限 (mm，100 步/mm)，0 表示不限制。</div>";
   html += "<div class='note'>接口：http://" + String(staConnected ? staIP : apIP) +
           "/moveto?x=1000&amp;y=1000&amp;z=500&amp;xv=150000&amp;xac=150000&amp;xsl=100"
           "&amp;yv=150000&amp;yac=150000&amp;ysl=100&amp;zv=150000&amp;zac=150000&amp;zsl=100"
@@ -498,14 +530,17 @@ function saveParams(){
     xAccel: document.getElementById('xAccel').value,
     xTravel: document.getElementById('xTravel').value,
     xPause: document.getElementById('xPause').value,
+    xMaxMm: document.getElementById('xMaxMm').value,
     ySpeed: document.getElementById('ySpeed').value,
     yAccel: document.getElementById('yAccel').value,
     yTravel: document.getElementById('yTravel').value,
     yPause: document.getElementById('yPause').value,
+    yMaxMm: document.getElementById('yMaxMm').value,
     zSpeed: document.getElementById('zSpeed').value,
     zAccel: document.getElementById('zAccel').value,
     zTravel: document.getElementById('zTravel').value,
-    zPause: document.getElementById('zPause').value
+    zPause: document.getElementById('zPause').value,
+    zMaxMm: document.getElementById('zMaxMm').value
   });
   fetch('/save?' + p.toString()).then(() => alert('参数已保存'));
 }
@@ -518,6 +553,7 @@ function startRun(mode){
     .then(t => {
       if(t === 'NO_AXIS'){ alert('请至少启用一个轴'); return; }
       if(t.indexOf('busy') >= 0){ alert('机器正在执行任务，完成后才能接受新指令'); }
+      if(t.indexOf('TRAVEL_LIMIT') >= 0){ alert('行程超出最大行程限制，请在运动参数中检查'); }
     });
 }
 function stopRun(){ fetch('/stop'); }
@@ -685,16 +721,19 @@ void handleSave() {
   if (server.hasArg("xAccel"))  xParam.acceleration = server.arg("xAccel").toInt();
   if (server.hasArg("xTravel")) xParam.travel       = server.arg("xTravel").toInt();
   if (server.hasArg("xPause"))  xParam.pauseMs      = server.arg("xPause").toInt();
+  if (server.hasArg("xMaxMm")) { long v = server.arg("xMaxMm").toInt(); if (v >= 0) xParam.maxTravelMm = (uint32_t)v; }
 
   if (server.hasArg("ySpeed"))  yParam.speed        = server.arg("ySpeed").toInt();
   if (server.hasArg("yAccel"))  yParam.acceleration = server.arg("yAccel").toInt();
   if (server.hasArg("yTravel")) yParam.travel       = server.arg("yTravel").toInt();
   if (server.hasArg("yPause"))  yParam.pauseMs      = server.arg("yPause").toInt();
+  if (server.hasArg("yMaxMm")) { long v = server.arg("yMaxMm").toInt(); if (v >= 0) yParam.maxTravelMm = (uint32_t)v; }
 
   if (server.hasArg("zSpeed"))  zParam.speed        = server.arg("zSpeed").toInt();
   if (server.hasArg("zAccel"))  zParam.acceleration = server.arg("zAccel").toInt();
   if (server.hasArg("zTravel")) zParam.travel       = server.arg("zTravel").toInt();
   if (server.hasArg("zPause"))  zParam.pauseMs      = server.arg("zPause").toInt();
+  if (server.hasArg("zMaxMm")) { long v = server.arg("zMaxMm").toInt(); if (v >= 0) zParam.maxTravelMm = (uint32_t)v; }
 
   applyParams();
   saveParamsToNVS();
@@ -719,6 +758,15 @@ void handleStart() {
 
   if (axisMask == 0) {
     server.send(200, "text/plain", "NO_AXIS");
+    return;
+  }
+
+  const char* over = 0;
+  if ((axisMask & AXIS_X) && targetExceedsLimit(xParam.travel, xParam.maxTravelMm)) over = "x";
+  else if ((axisMask & AXIS_Y) && targetExceedsLimit(yParam.travel, yParam.maxTravelMm)) over = "y";
+  else if ((axisMask & AXIS_Z) && targetExceedsLimit(zParam.travel, zParam.maxTravelMm)) over = "z";
+  if (over) {
+    server.send(400, "text/plain", String("TRAVEL_LIMIT_") + over);
     return;
   }
 
@@ -828,6 +876,21 @@ void handleMoveTo() {
     return;
   }
 
+  // 行程保护：目标超出最大行程 (mm) 则拒绝
+  int32_t targetX = hasX ? (int32_t)server.arg("x").toInt() : 0;
+  int32_t targetY = hasY ? (int32_t)server.arg("y").toInt() : 0;
+  int32_t targetZ = hasZ ? (int32_t)server.arg("z").toInt() : 0;
+  String over = "";
+  if (hasX && targetExceedsLimit(targetX, xParam.maxTravelMm)) over += "x ";
+  if (hasY && targetExceedsLimit(targetY, yParam.maxTravelMm)) over += "y ";
+  if (hasZ && targetExceedsLimit(targetZ, zParam.maxTravelMm)) over += "z ";
+  if (over.length() > 0) {
+    String msg = "{\"ok\":false,\"msg\":\"target exceeds max travel: ";
+    msg += over; msg += "\"}";
+    server.send(400, "application/json", msg);
+    return;
+  }
+
   // 忙检查已通过，此处必然空闲；清状态仅为兜底
   stopCycles();
   stopAllSteppers();
@@ -849,11 +912,11 @@ void handleMoveTo() {
   uint32_t globalPause = hasGlobalPause ? (uint32_t)server.arg("pause").toInt() : 0;
 
   // 接口任务只跑一轮，回到原点即结束
-  armCycle(xCycle, hasX, hasX ? (int32_t)server.arg("x").toInt() : 0,
+  armCycle(xCycle, hasX, targetX,
            hasGlobalPause ? globalPause : xParam.pauseMs, 0, false);
-  armCycle(yCycle, hasY, hasY ? (int32_t)server.arg("y").toInt() : 0,
+  armCycle(yCycle, hasY, targetY,
            hasGlobalPause ? globalPause : yParam.pauseMs, 0, false);
-  armCycle(zCycle, hasZ, hasZ ? (int32_t)server.arg("z").toInt() : 0,
+  armCycle(zCycle, hasZ, targetZ,
            hasGlobalPause ? globalPause : zParam.pauseMs, 0, false);
 
   apiRunning = true;
@@ -931,8 +994,16 @@ void handleClick() {
   int32_t zTrip = 500;
   if (server.hasArg("z")) zTrip = (int32_t)server.arg("z").toInt();
 
-  armClick(hasX, hasX ? (int32_t)server.arg("x").toInt() : 0,
-           hasY, hasY ? (int32_t)server.arg("y").toInt() : 0, zTrip);
+  int32_t targetX = hasX ? (int32_t)server.arg("x").toInt() : 0;
+  int32_t targetY = hasY ? (int32_t)server.arg("y").toInt() : 0;
+  if ((hasX && targetExceedsLimit(targetX, xParam.maxTravelMm)) ||
+      (hasY && targetExceedsLimit(targetY, yParam.maxTravelMm))) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"msg\":\"target exceeds max travel\"}");
+    return;
+  }
+
+  armClick(hasX, targetX, hasY, targetY, zTrip);
   server.send(200, "application/json", clickStartJson(zTrip));
 }
 
@@ -950,7 +1021,16 @@ void handleClickTo() {
   int32_t offX  = hasX ? (int32_t)server.arg("x").toInt() : 0;
   int32_t offY  = hasY ? (int32_t)server.arg("y").toInt() : 0;
 
-  armClick(hasX, baseX + offX, hasY, baseY + offY, zTrip);
+  int32_t targetX = baseX + offX;
+  int32_t targetY = baseY + offY;
+  if ((hasX && targetExceedsLimit(targetX, xParam.maxTravelMm)) ||
+      (hasY && targetExceedsLimit(targetY, yParam.maxTravelMm))) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"msg\":\"target exceeds max travel\"}");
+    return;
+  }
+
+  armClick(hasX, targetX, hasY, targetY, zTrip);
   server.send(200, "application/json", clickStartJson(zTrip));
 }
 
@@ -1093,6 +1173,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  initParamDefaults();
   loadParams();
   loadWiFiCreds();
 
