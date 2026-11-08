@@ -1,0 +1,14 @@
+# Arduino IDE / arduino-cli build output
+build/
+build_verify/
+*.elf
+*.map
+*.bin
+*.hex
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+*.bak
