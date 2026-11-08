@@ -2,6 +2,11 @@
 
 基于 ESP32-WROOM-32 与 FastAccelStepper 的写字机控制固件，通过 Wi-Fi 网页控制三轴（X / 双 Y / Z），支持 NVS 参数保存与 HTTP 接口调用。
 
+## 目录结构
+
+- `WritingMachine_WebController/`：Wi-Fi 网页控制固件，本项目主程序
+- `xyz/`：串口测试程序，上电即按固定参数往复，用于验证电机接线与方向
+
 ## 硬件接线
 
 | 轴 | STEP | DIR |
