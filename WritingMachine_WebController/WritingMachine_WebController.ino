@@ -142,6 +142,12 @@ bool machineBusy() {
   return systemRunning || apiRunning || clickRunning;
 }
 
+// 任务进行中时拒绝新的运动指令：上一条任务成功完成后才可接受下一步
+void sendBusy() {
+  server.send(409, "application/json",
+              "{\"ok\":false,\"msg\":\"busy, wait current task to finish\"}");
+}
+
 // /status 里各轴的阶段，只列出本次参与的轴
 String stageJson() {
   String json = "";
@@ -511,6 +517,7 @@ function startRun(mode){
     .then(r => r.text())
     .then(t => {
       if(t === 'NO_AXIS'){ alert('请至少启用一个轴'); return; }
+      if(t.indexOf('busy') >= 0){ alert('机器正在执行任务，完成后才能接受新指令'); }
     });
 }
 function stopRun(){ fetch('/stop'); }
@@ -695,6 +702,11 @@ void handleSave() {
 }
 
 void handleStart() {
+  if (machineBusy()) {
+    sendBusy();
+    return;
+  }
+
   String axes = server.hasArg("axes") ? server.arg("axes") : "";
   axisMask = 0;
   if (axes.indexOf('x') >= 0) axisMask |= AXIS_X;
@@ -801,6 +813,11 @@ String axisTuningJson(const char* name, const AxisParam& param, const AxisCycle&
 }
 
 void handleMoveTo() {
+  if (machineBusy()) {
+    sendBusy();
+    return;
+  }
+
   bool hasX = server.hasArg("x");
   bool hasY = server.hasArg("y");
   bool hasZ = server.hasArg("z");
@@ -811,7 +828,7 @@ void handleMoveTo() {
     return;
   }
 
-  // 打断网页端的往返/单次运行，避免两套动作互相抢电机
+  // 忙检查已通过，此处必然空闲；清状态仅为兜底
   stopCycles();
   stopAllSteppers();
 
@@ -877,22 +894,18 @@ void handleMoveTo() {
 }
 
 // ================= API：点击运动（移动到点 + Z 轴单击）=================
-// GET /click?x=10000&y=15000[&z=500]
-//   X/Y 移动到绝对坐标 (x, y) 并停住（不返回原点），到位后 Z 轴做 zTrip 步的单次往返。
-//   z 缺省 500；未给出的 X/Y 不移动。接口立即返回，进度查 /status。
-void handleClick() {
-  bool    hasX = server.hasArg("x");
-  bool    hasY = server.hasArg("y");
-  int32_t zTrip = 500;
-  if (server.hasArg("z")) zTrip = (int32_t)server.arg("z").toInt();
-
-  stopCycles();          // 打断正在进行的往复任务
+// GET /click?x=10000&y=15000[&z=500]     绝对坐标：X/Y 移动到 (x, y) 并停住
+// GET /clickto?x=1000&y=1500[&z=500]     相对坐标：X/Y 移动到 当前+(x, y) 并停住
+//   到位后 Z 轴做 zTrip 步的单次往返，X/Y 不返回原点。
+//   z 缺省 500；未给出的 X/Y 不移动。上一条任务完成后才接受新指令。
+void armClick(bool hasX, int32_t targetX, bool hasY, int32_t targetY, int32_t zTrip) {
+  stopCycles();
   stopAllSteppers();
 
   click.hasX    = hasX;
   click.hasY    = hasY;
-  click.targetX = hasX ? (int32_t)server.arg("x").toInt() : 0;
-  click.targetY = hasY ? (int32_t)server.arg("y").toInt() : 0;
+  click.targetX = targetX;
+  click.targetY = targetY;
   click.zTrip   = zTrip;
   click.zBase   = zStepper ? zStepper->getCurrentPosition() : 0;
   click.phase   = 0;
@@ -901,12 +914,44 @@ void handleClick() {
   Serial.print("API 点击: X="); Serial.print(click.targetX);
   Serial.print("  Y="); Serial.print(click.targetY);
   Serial.print("  Z单击="); Serial.print(click.zTrip); Serial.println("步");
+}
 
-  String resp = "{\"ok\":true,\"target\":{\"x\":" + String(click.targetX) +
-                ",\"y\":" + String(click.targetY) +
-                "},\"zTrip\":" + String(click.zTrip) +
-                ",\"msg\":\"started, poll /status\"}";
-  server.send(200, "application/json", resp);
+String clickStartJson(int32_t zTrip) {
+  return "{\"ok\":true,\"target\":{\"x\":" + String(click.targetX) +
+         ",\"y\":" + String(click.targetY) +
+         "},\"zTrip\":" + String(zTrip) +
+         ",\"msg\":\"started, poll /status\"}";
+}
+
+void handleClick() {
+  if (machineBusy()) { sendBusy(); return; }
+
+  bool    hasX  = server.hasArg("x");
+  bool    hasY  = server.hasArg("y");
+  int32_t zTrip = 500;
+  if (server.hasArg("z")) zTrip = (int32_t)server.arg("z").toInt();
+
+  armClick(hasX, hasX ? (int32_t)server.arg("x").toInt() : 0,
+           hasY, hasY ? (int32_t)server.arg("y").toInt() : 0, zTrip);
+  server.send(200, "application/json", clickStartJson(zTrip));
+}
+
+void handleClickTo() {
+  if (machineBusy()) { sendBusy(); return; }
+
+  bool    hasX  = server.hasArg("x");
+  bool    hasY  = server.hasArg("y");
+  int32_t zTrip = 500;
+  if (server.hasArg("z")) zTrip = (int32_t)server.arg("z").toInt();
+
+  // 相对坐标：当前 + 偏移（忙检查通过时机器必然空闲，位置计数准确）
+  int32_t baseX = xStepper ? xStepper->getCurrentPosition() : 0;
+  int32_t baseY = yLeft ? yLeft->getCurrentPosition() : 0;
+  int32_t offX  = hasX ? (int32_t)server.arg("x").toInt() : 0;
+  int32_t offY  = hasY ? (int32_t)server.arg("y").toInt() : 0;
+
+  armClick(hasX, baseX + offX, hasY, baseY + offY, zTrip);
+  server.send(200, "application/json", clickStartJson(zTrip));
 }
 
 // ================= 非阻塞往复推进（网页端与 API 共用）=================
@@ -1123,6 +1168,7 @@ void setup() {
   server.on("/moveto",  handleMoveTo);
   server.on("/move",    handleMoveTo);  // 兼容旧路径
   server.on("/click",   handleClick);
+  server.on("/clickto", handleClickTo);
   server.onNotFound(handleNotFound);
 
   server.begin();
