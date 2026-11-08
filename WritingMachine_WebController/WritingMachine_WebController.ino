@@ -90,6 +90,18 @@ struct AxisCycle {
 AxisCycle xCycle, yCycle, zCycle;
 bool      cycleStarted = false;  // 本轮去程是否已下发
 
+// ================= 点击运动状态（/click：移动到点 + Z 轴单击）=================
+// phase: 0 下发 X/Y 去程  1 等 X/Y 到位  2 Z 下压  3 Z 抬起
+struct ClickState {
+  bool     hasX = false, hasY = false;
+  int32_t  targetX = 0, targetY = 0;
+  int32_t  zTrip = 500;   // Z 轴点击行程（步）
+  int32_t  zBase = 0;     // 点击前 Z 的当前位置
+  uint8_t  phase = 0;
+};
+ClickState click;
+bool       clickRunning = false;
+
 // ================= EN 控制 =================
 void setMotorEnable(bool en) {
   digitalWrite(EN_PIN, en ? LOW : HIGH);
@@ -110,6 +122,8 @@ void stopCycles() {
   xCycle = AxisCycle();
   yCycle = AxisCycle();
   zCycle = AxisCycle();
+  clickRunning = false;
+  click = ClickState();
 }
 
 // 装配一个轴的往复任务
@@ -125,7 +139,7 @@ void armCycle(AxisCycle& axis, bool enabled, int32_t target,
 }
 
 bool machineBusy() {
-  return systemRunning || apiRunning;
+  return systemRunning || apiRunning || clickRunning;
 }
 
 // /status 里各轴的阶段，只列出本次参与的轴
@@ -734,6 +748,8 @@ void handleStatus() {
   json += "\"running\":" + String(machineBusy() ? "true" : "false") + ",";
   json += "\"api\":" + String(apiRunning ? "true" : "false") + ",";
   json += "\"stage\":{" + stageJson() + "},";
+  json += "\"click\":" + String(clickRunning ? "true" : "false") + ",";
+  json += "\"clickPhase\":" + String(click.phase) + ",";
   json += "\"x\":" + String(xStepper ? xStepper->getCurrentPosition() : 0) + ",";
   json += "\"y\":" + String(yLeft ? yLeft->getCurrentPosition() : 0) + ",";
   json += "\"z\":" + String(zStepper ? zStepper->getCurrentPosition() : 0);
@@ -860,6 +876,39 @@ void handleMoveTo() {
   server.send(200, "application/json", resp);
 }
 
+// ================= API：点击运动（移动到点 + Z 轴单击）=================
+// GET /click?x=10000&y=15000[&z=500]
+//   X/Y 移动到绝对坐标 (x, y) 并停住（不返回原点），到位后 Z 轴做 zTrip 步的单次往返。
+//   z 缺省 500；未给出的 X/Y 不移动。接口立即返回，进度查 /status。
+void handleClick() {
+  bool    hasX = server.hasArg("x");
+  bool    hasY = server.hasArg("y");
+  int32_t zTrip = 500;
+  if (server.hasArg("z")) zTrip = (int32_t)server.arg("z").toInt();
+
+  stopCycles();          // 打断正在进行的往复任务
+  stopAllSteppers();
+
+  click.hasX    = hasX;
+  click.hasY    = hasY;
+  click.targetX = hasX ? (int32_t)server.arg("x").toInt() : 0;
+  click.targetY = hasY ? (int32_t)server.arg("y").toInt() : 0;
+  click.zTrip   = zTrip;
+  click.zBase   = zStepper ? zStepper->getCurrentPosition() : 0;
+  click.phase   = 0;
+  clickRunning  = true;
+
+  Serial.print("API 点击: X="); Serial.print(click.targetX);
+  Serial.print("  Y="); Serial.print(click.targetY);
+  Serial.print("  Z单击="); Serial.print(click.zTrip); Serial.println("步");
+
+  String resp = "{\"ok\":true,\"target\":{\"x\":" + String(click.targetX) +
+                ",\"y\":" + String(click.targetY) +
+                "},\"zTrip\":" + String(click.zTrip) +
+                ",\"msg\":\"started, poll /status\"}";
+  server.send(200, "application/json", resp);
+}
+
 // ================= 非阻塞往复推进（网页端与 API 共用）=================
 // 推进单个轴，返回它接下来要下发的动作
 AxisAction advanceAxisCycle(AxisCycle& axis, bool running) {
@@ -908,7 +957,7 @@ AxisAction advanceAxisCycle(AxisCycle& axis, bool running) {
 }
 
 void updateCycles() {
-  if (!machineBusy()) return;
+  if (!systemRunning && !apiRunning) return;
 
   if (!cycleStarted) {
     setMotorEnable(true);
@@ -950,6 +999,47 @@ void updateCycles() {
     setMotorEnable(false);
     Serial.println(wasApi ? "API 定点往返完成，各轴已回到原点"
                           : "单次运行完成，各轴已回到原点");
+  }
+}
+
+// ================= 点击运动推进 =================
+void updateClick() {
+  if (!clickRunning) return;
+
+  switch (click.phase) {
+    case 0:  // 下发 X/Y 去程（到位后停住，不返回原点）
+      setMotorEnable(true);
+      if (click.hasX) xStepper->moveTo(click.targetX, false);
+      if (click.hasY) {
+        yLeft->moveTo(click.targetY, false);
+        yRight->moveTo(click.targetY, false);
+      }
+      click.phase = 1;
+      break;
+
+    case 1:  // 等 X/Y 都到位，然后 Z 下压
+      if ((!click.hasX || !xStepper->isRunning()) &&
+          (!click.hasY || !(yLeft->isRunning() || yRight->isRunning()))) {
+        zStepper->moveTo(click.zBase + click.zTrip, false);
+        click.phase = 2;
+      }
+      break;
+
+    case 2:  // 等 Z 下压到位，然后抬起
+      if (!zStepper->isRunning()) {
+        zStepper->moveTo(click.zBase, false);
+        click.phase = 3;
+      }
+      break;
+
+    case 3:  // 等 Z 抬起到位，结束
+      if (!zStepper->isRunning()) {
+        clickRunning = false;
+        click.phase  = 0;
+        setMotorEnable(false);
+        Serial.println("点击完成：X/Y 停在目标，Z 已抬起");
+      }
+      break;
   }
 }
 
@@ -1032,6 +1122,7 @@ void setup() {
   server.on("/status",  handleStatus);
   server.on("/moveto",  handleMoveTo);
   server.on("/move",    handleMoveTo);  // 兼容旧路径
+  server.on("/click",   handleClick);
   server.onNotFound(handleNotFound);
 
   server.begin();
@@ -1045,6 +1136,7 @@ void loop() {
     dnsServer.processNextRequest();
   }
   updateCycles();
+  updateClick();
 
   if (closeAPPending && millis() - closeAPTime > 2000) {
     disableAP();
